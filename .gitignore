@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# SQLite shard files
+topk_shard_*.db
+topk.db
+
+# Logs
+*.log
