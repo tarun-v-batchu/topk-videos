@@ -2,30 +2,60 @@
 
 A real-time API that tracks video view counts and returns the top-K most-watched videos over four timeframes: **last hour**, **last day**, **last month**, and **all time**.
 
-## How it works
+## Architecture
 
+```mermaid
+flowchart LR
+    Client(["Client"])
+    POST["POST /watched"]
+
+    subgraph Queue["Partitioned Queue · 10 partitions\nMD5(videoId) % 10"]
+        direction TB
+        P0["P0"] ~~~ P1["P1"] ~~~ Pdot["…"] ~~~ P9["P9"]
+    end
+
+    subgraph Workers["Flink Workers · 10 threads\nbuffer → flush every N s (staggered)"]
+        direction TB
+        W0["W0"] ~~~ W1["W1"] ~~~ Wdot["…"] ~~~ W9["W9"]
+    end
+
+    subgraph DB["Sharded DB · 10 SQLite files"]
+        direction TB
+        HC[("hour_counts · 24 h")]
+        DC[("day_counts · 31 d")]
+        MC[("month_counts")]
+        AT[("alltime_counts")]
+    end
+
+    Cron(["Cron\nhour → day at :01\nday → month at 00:02"])
+
+    subgraph TopKSvc["Top-K Service"]
+        direction TB
+        H["① min-heap per shard\n   local top-100  O(n log k)"]
+        M["② k-way merge across shards\n   global top-100  O(k log 10)"]
+        H --> M
+    end
+
+    Redis[("Redis\ntopk:last_hour\ntopk:last_day\ntopk:last_month\ntopk:all_time")]
+
+    GET["GET /top_videos"]
+
+    Client -->|"videoId, timestamp"| POST
+    POST -->|"publish"| Queue
+    Queue -->|"consume"| Workers
+    Workers -->|"upsert hour + alltime"| DB
+    DB <-->|"rollup + trim"| Cron
+    DB -->|"after flush + every 30 s"| TopKSvc
+    TopKSvc -->|"write top-100"| Redis
+    Redis -->|"serve from cache"| GET
+    Client -->|"k, timeframe"| GET
 ```
-POST /watched
-     │
-     ▼
- Partitioned Queue  (10 partitions, routed by hash(videoId))
-     │
-     ▼
- Flink Workers  (one per partition — buffers events, flushes every N seconds)
-     │
-     ▼
-  Sharded DB  (10 SQLite shards — hour / day / month / all-time tables)
-     │
-     ▼
- Top-K Service  (min-heap per shard → k-way merge → Redis cache)
-     │
-     ▼
-GET /top_videos  ←  Redis
-```
+
+## How it works
 
 **Ingestion** — `POST /watched` publishes a view event to one of 10 in-memory queue partitions, chosen by `MD5(videoId) % 10`. Every video is permanently owned by exactly one partition.
 
-**Aggregation (Flink workers)** — Each partition has a dedicated background worker that drains its queue in micro-batches, accumulates `(videoId, hourBucket) → count` in memory, and flushes to its dedicated SQLite shard every `FLINK_FLUSH_INTERVAL` seconds. Workers are staggered so they don't all hit disk at the same moment.
+**Aggregation (Flink workers)** — Each partition has a dedicated background worker that drains its queue in micro-batches, accumulates `(videoId, hourBucket) → count` in memory, and flushes to its dedicated SQLite shard every `FLINK_FLUSH_INTERVAL` seconds. Workers are staggered across the flush window so they don't all hit disk at the same moment.
 
 **Storage** — Each shard holds four tables:
 
